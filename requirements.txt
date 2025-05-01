@@ -9,3 +9,4 @@ pydeck==0.8.0
 sqlalchemy==2.0.23
 matplotlib==3.8.2
 seaborn==0.13.0
+statsmodels==0.14.0
