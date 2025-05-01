@@ -12,21 +12,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 # Load environment variables
-POSTGRES_HOST = os.getenv("POSTGRES_HOST")
-POSTGRES_PORT = os.getenv("POSTGRES_PORT")
-POSTGRES_DB = os.getenv("POSTGRES_DB")
-POSTGRES_USER = os.getenv("POSTGRES_USER")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
+# POSTGRES_HOST = os.getenv("POSTGRES_HOST")
+# POSTGRES_PORT = os.getenv("POSTGRES_PORT")
+# POSTGRES_DB = os.getenv("POSTGRES_DB")
+# POSTGRES_USER = os.getenv("POSTGRES_USER")
+# POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 
 
-# Database connection parameters
-DB_PARAMS = {
-    "host": POSTGRES_HOST,
-    "port": POSTGRES_PORT,
-    "database": POSTGRES_DB,
-    "user": POSTGRES_USER,
-    "password": POSTGRES_PASSWORD,
-}
+# # Database connection parameters
+# DB_PARAMS = {
+#     "host": POSTGRES_HOST,
+#     "port": POSTGRES_PORT,
+#     "database": POSTGRES_DB,
+#     "user": POSTGRES_USER,
+#     "password": POSTGRES_PASSWORD,
+# }
 
 # Set page config
 st.set_page_config(
@@ -39,11 +39,15 @@ st.set_page_config(
 
 # SQLAlchemy engine for pandas operations
 @st.cache_resource
+# In your database connection function
 def get_db_engine():
     """Create a SQLAlchemy engine for database connections"""
     try:
-        # Create SQLAlchemy engine for pandas
-        db_url = f"postgresql+psycopg2://{DB_PARAMS['user']}:{DB_PARAMS['password']}@{DB_PARAMS['host']}:{DB_PARAMS['port']}/{DB_PARAMS['database']}"
+        # Use Streamlit secrets
+        db_config = st.secrets["database"]
+        
+        # Create SQLAlchemy engine
+        db_url = f"postgresql+psycopg2://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['database']}"
         engine = create_engine(db_url)
         return engine
     except Exception as e:
@@ -53,15 +57,19 @@ def get_db_engine():
 # Direct psycopg2 connection for operations that need it
 @st.cache_resource
 def get_psycopg2_connection():
-    """Create a direct psycopg2 connection"""
+    """Create a direct psycopg2 connection using Streamlit secrets"""
     try:
+        # Get database credentials from Streamlit secrets
+        db_config = st.secrets["database"]
+        
         conn = psycopg2.connect(
-            host=DB_PARAMS["host"],
-            port=DB_PARAMS["port"],
-            database=DB_PARAMS["database"],
-            user=DB_PARAMS["user"],
-            password=DB_PARAMS["password"],
-            sslmode="require"
+            host=db_config["host"],
+            port=db_config["port"],
+            database=db_config["database"],
+            user=db_config["user"],
+            password=db_config["password"],
+            sslmode="require",
+            connect_timeout=10
         )
         return conn
     except Exception as e:

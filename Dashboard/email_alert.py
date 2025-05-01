@@ -10,8 +10,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 # Load environment variables
-EMAIL_SENDER = os.getenv("EMAIL_SENDER")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")  
+# EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+# EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")  
 
 
 def parse_email_list(email_string):
@@ -151,10 +151,8 @@ def test_email_alert(recipients):
 def send_email(recipient, subject, body):
    
     # Replace these with your actual email and app password
-    sender_email = EMAIL_SENDER
-    
-    # Use an app password instead of your regular password
-    sender_password = EMAIL_PASSWORD
+    sender_email = st.secrets["email"]["sender"]
+    sender_password = st.secrets["email"]["password"]
     if not sender_email or not sender_password:
         st.error("Email sender or password not configured.")
         return False  
