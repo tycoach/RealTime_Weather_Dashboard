@@ -94,23 +94,46 @@ def execute_query(query, params=None):
 
 # Function to load data using SQLAlchemy
 
-# Updated function to load data using psycopg2 connection
+
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def load_analytics_data(time_period):
-    """Load analytics data for the specified time period"""
+    """Load analytics data for the specified time period with dynamic timeframe"""
     try:
         conn = get_psycopg2_connection()
         if not conn:
+            st.error("Could not connect to database")
             return pd.DataFrame()
         
+        # First, check the most recent available data
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT MAX(window_start) FROM weather_analytics")
+            latest_window = cursor.fetchone()[0]
+            
+            if latest_window is None:
+                st.error("No data found in weather_analytics table")
+                return pd.DataFrame()
+            
+            # Get the time difference between now and the latest record
+            cursor.execute("SELECT NOW() AT TIME ZONE 'UTC' - %s", (latest_window,))
+            time_diff = cursor.fetchone()[0]
+            
+            # Display debugging info
+            st.sidebar.info(f"Latest data timestamp: {latest_window}")
+            st.sidebar.info(f"Data age: {time_diff}")
+        
+        # Use the latest window_start as reference instead of NOW()
         if time_period == "Last 24 Hours":
-            time_filter = "window_start >= NOW() - INTERVAL '24 hours'"
+            time_filter = f"window_start >= %s - INTERVAL '24 hours'"
+            params = (latest_window,)
         elif time_period == "Last Week":
-            time_filter = "window_start >= NOW() - INTERVAL '7 days'"
+            time_filter = f"window_start >= %s - INTERVAL '7 days'"
+            params = (latest_window,)
         elif time_period == "Last Month":
-            time_filter = "window_start >= NOW() - INTERVAL '30 days'"
+            time_filter = f"window_start >= %s - INTERVAL '30 days'"
+            params = (latest_window,)
         else:
-            time_filter = "window_start >= NOW() - INTERVAL '24 hours'"
+            time_filter = f"window_start >= %s - INTERVAL '24 hours'"
+            params = (latest_window,)
         
         query = f"""
             SELECT 
@@ -123,41 +146,57 @@ def load_analytics_data(time_period):
             ORDER BY window_start DESC, city_name
         """
         
-        # Use pandas read_sql with the psycopg2 connection
-        df = pd.read_sql(query, conn)
+        # Use cursor to execute with params
+        with conn.cursor() as cursor:
+            cursor.execute(query, params)
+            columns = [desc[0] for desc in cursor.description]
+            data = cursor.fetchall()
+            
+        # Convert to DataFrame
+        df = pd.DataFrame(data, columns=columns)
         
-        # Don't close the connection as it's cached and reused
+        # Debug: Show data info
+        if not df.empty:
+            st.sidebar.success(f"Retrieved {len(df)} records. Date range: {df['window_start'].min()} to {df['window_start'].max()}")
+        else:
+            st.sidebar.warning("No data returned from query")
+        
         return df
     except Exception as e:
         st.error(f"Error loading analytics data: {e}")
         return pd.DataFrame()
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300)  # Cache for 5 minutes
 def load_forecast_data():
-    """Load weather forecast data"""
+    """Load weather forecast data using most recent available data as reference"""
     try:
         conn = get_psycopg2_connection()
         if not conn:
             return pd.DataFrame()
         
-      
+        # First find most recent forecasts
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT MAX(window_start) FROM weather_forecast")
+            latest_window = cursor.fetchone()[0]
+            
+            if latest_window is None:
+                st.error("No data found in weather_forecast table")
+                return pd.DataFrame()
+        
+        # Get forecasts from the most recent batch
         query = """
             SELECT 
                 city_name, country, window_start, window_end,
                 forecast_max_temp, forecast_min_temp,
                 forecast_rain_chance, forecast_condition,
-                created_at
+                has_weather_alerts, created_at
             FROM weather_forecast
-            WHERE window_start >= CURRENT_DATE
+            WHERE created_at = (SELECT MAX(created_at) FROM weather_forecast)
             ORDER BY city_name, window_start
         """
-      
+        
+        # Use pandas read_sql with the psycopg2 connection
         df = pd.read_sql(query, conn)
-    
-        column_mapping = {
-            'window_start': 'forecast_date'  # Map window_start to forecast_date for compatibility
-        }
-        df = df.rename(columns=column_mapping)
         
         # Don't close the connection as it's cached and reused
         return df
@@ -214,7 +253,286 @@ def load_historical_data(days=30):
     except Exception as e:
         st.error(f"Error loading historical data: {e}")
         return pd.DataFrame()   
+    
+def get_latest_weather_data():
+    """Get the most recent weather data for each city"""
+    try:
+        conn = get_psycopg2_connection()
+        if not conn:
+            st.error("Could not connect to database")
+            return pd.DataFrame()
+        
+        # Query to get only the latest weather data for each city
+        query = """
+            WITH LatestWindows AS (
+                SELECT 
+                    city_name,
+                    MAX(window_start) as latest_window
+                FROM 
+                    weather_analytics
+                GROUP BY 
+                    city_name
+            )
+            SELECT 
+                wa.city_name, wa.country, wa.window_start, wa.window_end,
+                wa.hourly_avg_temp, wa.hourly_max_temp, wa.hourly_min_temp,
+                wa.hourly_avg_humidity, wa.hourly_avg_pressure, wa.hourly_avg_wind,
+                wa.hourly_total_precipitation, wa.hourly_avg_uv, wa.hourly_confidence
+            FROM 
+                weather_analytics wa
+            JOIN 
+                LatestWindows lw ON wa.city_name = lw.city_name AND wa.window_start = lw.latest_window
+            ORDER BY 
+                wa.city_name
+        """
+        
+        # Use pandas read_sql with the psycopg2 connection
+        df = pd.read_sql(query, conn)
+        
+        return df
+    except Exception as e:
+        st.error(f"Error loading latest weather data: {e}")
+        return pd.DataFrame()
 
+def load_minimal_analytics_data():
+    """Load a minimal set of analytics data for context in current weather view"""
+    try:
+        conn = get_psycopg2_connection()
+        if not conn:
+            return pd.DataFrame()
+        
+        # Get data from the last few hours only
+        query = """
+            SELECT 
+                city_name, country, window_start, window_end,
+                hourly_avg_temp, hourly_max_temp, hourly_min_temp,
+                hourly_avg_humidity, hourly_avg_pressure, hourly_avg_wind,
+                hourly_total_precipitation, hourly_avg_uv, hourly_confidence
+            FROM weather_analytics
+            WHERE window_start >= (
+                SELECT MAX(window_start) - INTERVAL '3 hours' 
+                FROM weather_analytics
+            )
+            ORDER BY window_start DESC, city_name
+        """
+        
+        # Use pandas read_sql with the psycopg2 connection
+        df = pd.read_sql(query, conn)
+        
+        return df
+    except Exception as e:
+        print(f"Error loading minimal analytics data: {e}")
+        return pd.DataFrame()
+
+def display_current_weather_view(df, selected_cities):
+    """Display a detailed view of current weather with standardized duplicates removal"""
+    if df.empty:
+        st.warning("No current weather data available.")
+        return
+    
+    # Filter by selected cities if needed
+    if selected_cities and len(selected_cities) > 0:
+        df = df[df['city_name'].isin(selected_cities)]
+        
+    if df.empty:
+        st.warning("No current weather data available for selected cities.")
+        return
+    
+    # Remove duplicates by taking the most recent entry for each city
+    df = df.sort_values('window_start', ascending=False)
+    df = df.drop_duplicates(subset=['city_name'], keep='first')
+    
+    # Create a grid layout of weather cards - 4 per row max
+    num_cities = len(df)
+    cities_per_row = min(4, num_cities)
+    
+    # Process all cities in a grid layout
+    for i in range(0, num_cities, cities_per_row):
+        cols = st.columns(cities_per_row)
+        
+        for j in range(cities_per_row):
+            idx = i + j
+            if idx < num_cities:
+                row = df.iloc[idx]
+                
+                # Determine weather icon based on conditions
+                temp = row['hourly_avg_temp']
+                precip = row.get('hourly_total_precipitation', 0)
+                humidity = row.get('hourly_avg_humidity', 0)
+                wind = row.get('hourly_avg_wind', 0)
+                
+                # Set icon based on conditions
+                if precip > 5.0:
+                    icon = "🌧️"  # rain
+                elif precip > 0.0:
+                    icon = "🌦️"  # light rain
+                elif humidity > 80:
+                    icon = "☁️"  # cloudy
+                elif temp > 30:
+                    icon = "☀️"  # sunny/hot
+                elif temp < 5:
+                    icon = "❄️"  # cold
+                elif wind > 10:
+                    icon = "💨"  # windy
+                else:
+                    icon = "⛅"  # partly cloudy
+                
+                with cols[j]:
+                    # Format timestamp
+                    timestamp = pd.to_datetime(row['window_start']).strftime('%Y-%m-%d %H:%M')
+                    
+                    # Create weather card
+                    st.markdown(
+                        f"""
+                        <div style="border:1px solid #555; border-radius:10px; padding:15px; margin-bottom:20px; background-color:rgba(40,40,40,0.7)">
+                            <div style="font-size:20px; font-weight:bold; display:flex; justify-content:space-between; margin-bottom:5px">
+                                <span>{row['city_name']}, {row['country']}</span>
+                                <span style="font-size:28px">{icon}</span>
+                            </div>
+                            <div style="font-size:32px; font-weight:bold; margin:10px 0">
+                                {row['hourly_avg_temp']:.1f}°C
+                            </div>
+                            <div style="display:flex; justify-content:space-between; font-size:14px; margin-bottom:10px">
+                                <span>Range: {row['hourly_min_temp']:.1f}°C to {row['hourly_max_temp']:.1f}°C</span>
+                            </div>
+                            <div style="margin-top:10px; font-size:14px">
+                                <div style="margin-bottom:4px">
+                                    <span>Humidity: {row['hourly_avg_humidity']:.1f}%</span>
+                                </div>
+                                <div style="margin-bottom:4px">
+                                    <span>Wind: {row['hourly_avg_wind']:.1f} m/s</span>
+                                </div>
+                                <div style="margin-bottom:4px">
+                                    <span>Updated: {timestamp}</span>
+                                </div>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+    
+    
+def get_latest_weather_data():
+    """Get the most recent weather data for each city with duplicate removal"""
+    try:
+        conn = get_psycopg2_connection()
+        if not conn:
+            st.error("Could not connect to database")
+            return pd.DataFrame()
+        
+        # Query to get only the latest weather data for each city
+        # This query guarantees exactly one row per city by using a window function
+        query = """
+            WITH RankedData AS (
+                SELECT 
+                    wa.*,
+                    ROW_NUMBER() OVER (PARTITION BY city_name ORDER BY window_start DESC) as rn
+                FROM 
+                    weather_analytics wa
+            )
+            SELECT 
+                city_name, country, window_start, window_end,
+                hourly_avg_temp, hourly_max_temp, hourly_min_temp,
+                hourly_avg_humidity, hourly_avg_pressure, hourly_avg_wind,
+                hourly_total_precipitation, hourly_avg_uv, hourly_confidence
+            FROM 
+                RankedData
+            WHERE 
+                rn = 1
+            ORDER BY 
+                city_name
+        """
+        
+        # Use pandas read_sql with the psycopg2 connection
+        df = pd.read_sql(query, conn)
+        
+        # Double-check for duplicates and remove if any still exist
+        if len(df) > df['city_name'].nunique():
+            print(f"Warning: Duplicates found after SQL query. Before: {len(df)}, Unique: {df['city_name'].nunique()}")
+            df = df.sort_values('window_start', ascending=False)
+            df = df.drop_duplicates(subset=['city_name'], keep='first')
+            
+        return df
+    except Exception as e:
+        st.error(f"Error loading latest weather data: {e}")
+        return pd.DataFrame()
+    
+def display_todays_forecast(forecast_df, selected_cities):
+    """Display a simplified forecast for today only"""
+    if forecast_df.empty:
+        return
+    
+    # Filter by selected cities if needed
+    if selected_cities and len(selected_cities) > 0:
+        filtered_df = forecast_df[forecast_df['city_name'].isin(selected_cities)]
+    else:
+        filtered_df = forecast_df
+    
+    if filtered_df.empty:
+        return
+    
+    # Determine date column
+    date_column = None
+    for col in ['forecast_date', 'window_start', 'created_at']:
+        if col in filtered_df.columns:
+            date_column = col
+            break
+    
+    if date_column is None:
+        return
+    
+    # Convert to datetime
+    filtered_df[date_column] = pd.to_datetime(filtered_df[date_column])
+    
+    # Get today's date
+    today = pd.Timestamp.now().date()
+    
+    # Filter for today only
+    todays_forecast = filtered_df[filtered_df[date_column].dt.date == today]
+    
+    if todays_forecast.empty:
+        return
+    
+    # Display simplified forecast
+    for city in sorted(todays_forecast['city_name'].unique()):
+        # Get forecast for this city
+        city_forecast = todays_forecast[todays_forecast['city_name'] == city]
+        
+        # Calculate high and low
+        high = city_forecast['forecast_max_temp'].max() if 'forecast_max_temp' in city_forecast else None
+        low = city_forecast['forecast_min_temp'].min() if 'forecast_min_temp' in city_forecast else None
+        
+        # Get rain chance
+        rain_chance = city_forecast['forecast_rain_chance'].max() if 'forecast_rain_chance' in city_forecast else None
+        
+        # Extract a condition summary if available
+        conditions = []
+        if 'forecast_condition' in city_forecast:
+            for condition in city_forecast['forecast_condition'].unique():
+                if isinstance(condition, str) and len(condition) > 0:
+                    conditions.append(condition)
+        
+        condition_text = ", ".join(conditions) if conditions else "No condition data"
+        
+        # Create forecast card
+        st.markdown(
+            f"""
+            <div style="border:1px solid #555; border-radius:10px; padding:15px; margin-bottom:15px; background-color:rgba(40,40,40,0.4)">
+                <div style="font-size:20px; font-weight:bold; margin-bottom:10px">
+                    {city}
+                </div>
+                <div style="display:flex; justify-content:space-between; font-size:16px; margin-bottom:10px">
+                    <span>High: {high:.1f}°C</span>
+                    <span>Low: {low:.1f}°C</span>
+                    <span>Rain: {rain_chance:.0f}%</span>
+                </div>
+                <div style="font-size:14px; color:#ccc;">
+                    {condition_text}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 # Define alert thresholds
 ALERT_THRESHOLDS = {
     "high_temp": 35.0,          # °C
@@ -297,12 +615,10 @@ def display_sidebar():
     st.sidebar.title("Weather Stream Dashboard")
     st.sidebar.image("https://img.icons8.com/fluency/96/000000/partly-cloudy-day.png", width=80)
     
-  
-
-    # Time period filter
+    # Time period filter with Current Weather option
     time_period = st.sidebar.selectbox(
         "Select Time Period",
-        ["Last 24 Hours", "Last Week", "Last Month"]
+        ["Current Weather", "Last 24 Hours", "Last Week", "Last Month"]
     )
     
     # Load city list for filtering
@@ -347,10 +663,32 @@ def display_sidebar():
         ALERT_THRESHOLDS["high_precipitation"] = high_precipitation
         ALERT_THRESHOLDS["high_uv"] = high_uv
     
+    # Add prediction window slider if not in Current Weather mode
+    if time_period != "Current Weather":
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("Prediction Window (hours)")
+        prediction_window = st.sidebar.slider("", 1, 48, 6)
+    else:
+        # Default value when not shown
+        prediction_window = 6
+    
     st.sidebar.markdown("---")
     st.sidebar.info("Data refreshes every 15 minutes")
     
-    return time_period, selected_country, selected_cities
+    # Try to display the latest data timestamp
+    try:
+        conn = get_psycopg2_connection()
+        if conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT MAX(window_start) FROM weather_analytics")
+                latest_time = cursor.fetchone()[0]
+                if latest_time:
+                    st.sidebar.info(f"Latest data timestamp: {latest_time.strftime('%Y-%m-%d')}")
+    except:
+        pass
+    
+    return time_period, selected_country, selected_cities, prediction_window
+
 
 def format_city_data(df, selected_cities):
     """Format data for selected cities"""
@@ -613,123 +951,87 @@ def display_alerts(alerts):
         alert_html += "</table><br>"
         st.markdown(alert_html, unsafe_allow_html=True)
 
+
+# Modify the display_forecast function to handle different column names
 def display_forecast(forecast_df, selected_cities):
-    """Display weather forecast"""
+    """Display weather forecast for selected cities"""
     if forecast_df.empty:
-        st.warning("No forecast data available.")
+        st.info("No forecast data available.")
         return
     
-    # Filter by selected cities
+    # Print column names for debugging
+    print("Forecast DataFrame columns:", forecast_df.columns.tolist())
+    
+    # Determine the date column based on what's available
+    date_column = None
+    for col in ['forecast_date', 'window_start', 'created_at']:
+        if col in forecast_df.columns:
+            date_column = col
+            break
+    
+    if date_column is None:
+        st.error("No suitable date column found in forecast data.")
+        return
+    
+    # Filter by selected cities if not "All"
     if selected_cities and "All" not in selected_cities:
-        forecast_df = forecast_df[forecast_df['city_name'].isin(selected_cities)]
+        filtered_df = forecast_df[forecast_df['city_name'].isin(selected_cities)]
+    else:
+        filtered_df = forecast_df.copy()
     
-    if forecast_df.empty:
-        st.warning("No forecast data available for selected cities.")
+    if filtered_df.empty:
+        st.info("No forecast data available for selected cities.")
         return
     
-    st.subheader("Weather Forecast")
+    # Sort cities by name for consistent display
+    cities = sorted(filtered_df['city_name'].unique())
     
-    # Convert forecast_date to datetime if needed
-    if 'forecast_date' in forecast_df.columns:
-        forecast_df['forecast_date'] = pd.to_datetime(forecast_df['forecast_date'])
-    
-    # Group by city and create tabs
-    cities = sorted(forecast_df['city_name'].unique())
-    if not cities:
-        st.warning("No forecast data available.")
-        return
-    
-    city_tabs = st.tabs(cities)
-    
-    for i, city in enumerate(cities):
-        with city_tabs[i]:
-            city_forecast = forecast_df[forecast_df['city_name'] == city].sort_values('forecast_date')
+    for city in cities:
+        st.subheader(f"{city} Weather Forecast")
+        
+        try:
+            # Get forecast for this city and sort by date
+            city_forecast = filtered_df[filtered_df['city_name'] == city].sort_values(date_column)
             
-            # Display temperature forecast
-            temp_fig = px.line(
-                city_forecast,
-                x='forecast_date',
-                y=['forecast_max_temp', 'forecast_min_temp'],
-                labels={
-                    'forecast_date': 'Date',
-                    'value': 'Temperature (°C)',
-                    'variable': 'Metric'
-                },
-                title=f"Temperature Forecast for {city}",
-                color_discrete_map={
-                    'forecast_max_temp': '#EF553B',
-                    'forecast_min_temp': '#00CC96'
-                }
-            )
+            # Create date groups for better display
+            city_forecast['date_group'] = pd.to_datetime(city_forecast[date_column]).dt.date
             
-            # Add area between min and max
-            temp_fig.add_trace(
-                go.Scatter(
-                    x=city_forecast['forecast_date'].tolist() + city_forecast['forecast_date'].tolist()[::-1],
-                    y=city_forecast['forecast_max_temp'].tolist() + city_forecast['forecast_min_temp'].tolist()[::-1],
-                    fill='toself',
-                    fillcolor='rgba(0, 100, 80, 0.2)',
-                    line=dict(color='rgba(255, 255, 255, 0)'),
-                    showlegend=False,
-                    name=f"Temperature Range",
-                )
-            )
-            
-            temp_fig.update_layout(height=300, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-            st.plotly_chart(temp_fig, use_container_width=True)
-            
-            # Display precipitation forecast - Updated to use forecast_rain_chance instead
-            if 'forecast_rain_chance' in city_forecast.columns:
-                precip_fig = px.bar(
-                    city_forecast,
-                    x='forecast_date',
-                    y='forecast_rain_chance',
-                    labels={
-                        'forecast_date': 'Date',
-                        'forecast_rain_chance': 'Rain Chance (%)'
-                    },
-                    title=f"Precipitation Forecast for {city}",
-                    color='forecast_rain_chance',
-                    color_continuous_scale='Blues'
-                )
-                st.plotly_chart(precip_fig, use_container_width=True)
-            
-            # Display forecast details in a table
-            st.markdown("### Detailed Forecast")
-            
-            # Adjust the columns to match the schema
-            forecast_columns = ['forecast_date', 'forecast_max_temp', 'forecast_min_temp']
-            
-            if 'forecast_rain_chance' in city_forecast.columns:
-                forecast_columns.append('forecast_rain_chance')
-            
-            if 'forecast_condition' in city_forecast.columns:
-                forecast_columns.append('forecast_condition')
+            # Display forecast by date
+            for date, group in city_forecast.groupby('date_group'):
+                st.markdown(f"**{date}**")
                 
-            if 'has_alerts' in city_forecast.columns:
-                forecast_columns.append('has_alerts')
-            
-            forecast_table = city_forecast[forecast_columns]
-            
-            # Create readable column names for the table
-            column_display_names = {
-                'forecast_date': 'Date',
-                'forecast_max_temp': 'Max Temp (°C)',
-                'forecast_min_temp': 'Min Temp (°C)',
-                'forecast_rain_chance': 'Rain Chance (%)',
-                'forecast_condition': 'Conditions',
-                'has_alerts': 'Weather Alerts'
-            }
-            
-            forecast_table = forecast_table.rename(columns=column_display_names)
-            
-            # Format the date
-            if 'Date' in forecast_table.columns:
-                forecast_table['Date'] = forecast_table['Date'].dt.strftime('%Y-%m-%d')
-            
-            st.dataframe(forecast_table, use_container_width=True)
-
-
+                # Create a forecast table
+                forecast_table = []
+                
+                for _, row in group.iterrows():
+                    # Get time component for display
+                    time_str = pd.to_datetime(row[date_column]).strftime('%H:%M')
+                    
+                    # Get temperature and condition data
+                    max_temp = row['forecast_max_temp'] if 'forecast_max_temp' in row else 'N/A'
+                    min_temp = row['forecast_min_temp'] if 'forecast_min_temp' in row else 'N/A'
+                    condition = row['forecast_condition'] if 'forecast_condition' in row else 'N/A'
+                    rain_chance = row['forecast_rain_chance'] if 'forecast_rain_chance' in row else 'N/A'
+                    
+                    # Append to forecast table
+                    forecast_table.append({
+                        "Time": time_str,
+                        "Max Temp (°C)": f"{max_temp:.1f}" if isinstance(max_temp, (int, float)) else max_temp,
+                        "Min Temp (°C)": f"{min_temp:.1f}" if isinstance(min_temp, (int, float)) else min_temp,
+                        "Condition": condition,
+                        "Rain Chance (%)": f"{rain_chance:.0f}" if isinstance(rain_chance, (int, float)) else rain_chance
+                    })
+                
+                # Display as a DataFrame
+                if forecast_table:
+                    st.table(pd.DataFrame(forecast_table))
+                else:
+                    st.info(f"No hourly forecast data available for {date}")
+                
+                st.markdown("---")
+                
+        except Exception as e:
+            st.error(f"Error displaying forecast for {city}: {e}")
 
 def display_weather_map(df):
     """Display an interactive weather map"""
